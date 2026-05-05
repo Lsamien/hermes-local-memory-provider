@@ -1,0 +1,98 @@
+hermes:
+  sqlite_path: "${HERMES_HOME}/state.db"
+  original_provider: "graphiti"
+
+hermes_schema:
+  table: "messages"
+  id_column: "id"
+  session_column: "session_id"
+  role_column: "role"
+  content_column: "content"
+  created_at_column: "timestamp"
+
+memory_index:
+  sqlite_path: "${HERMES_HOME}/memory/local_memory/memory_index.sqlite"
+  use_wal: true
+
+provider_adapter:
+  provider_name: "local_memory"
+  fail_open: true
+
+recall:
+  total_timeout_ms: 1000
+  hard_timeout_ms: 1500
+  max_results: 6
+  max_context_tokens: 1200
+  context_window_before: 3
+  context_window_after: 3
+
+fts:
+  enabled: true
+  timeout_ms: 300
+  use_jieba: false
+  max_results: 20
+
+graphiti:
+  enabled: true
+  timeout_ms: 1200
+  endpoint: "http://localhost:18000/mcp"
+  group_id: "default"
+  recall_max_results: 3
+  sync_batch_turns: 3
+  async_write: true
+
+reflector:
+  enabled: true
+  sqlite_path: "${HERMES_HOME}/memory/local_memory/reflector.sqlite"
+  async: true
+  trigger_every_n_turns: 12
+  prefetch_summaries: 1
+  conflict_detection: true
+
+nsfw:
+  save: true
+  index: true
+  default_recall: false
+  allow_explicit_history_search: true
+  keywords_en:
+    - "nsfw"
+    - "18+"
+    - "adult"
+    - "explicit"
+    - "erotic"
+    - "sex"
+    - "sexual"
+    - "sexy"
+    - "nude"
+    - "nudity"
+    - "porn"
+    - "xxx"
+    - "fetish"
+    - "kink"
+  keywords_zh:
+    - "成人"
+    - "露骨"
+    - "色情"
+    - "性爱"
+    - "性交"
+    - "做爱"
+    - "裸体"
+    - "无码"
+    - "有码"
+    - "黄片"
+    - "成人视频"
+    - "约炮"
+    - "调教"
+    - "性癖"
+  extra_keywords: []
+  query_keywords:
+    - "nsfw历史"
+    - "成人历史"
+    - "explicit history"
+
+upgrade_safety:
+  do_not_modify_hermes_core: true
+  do_not_alter_hermes_sqlite: true
+  read_hermes_sqlite_only: true
+  write_index_to_sidecar_sqlite: true
+  compatibility_adapter_required: true
