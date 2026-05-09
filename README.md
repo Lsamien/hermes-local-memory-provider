@@ -3,12 +3,18 @@
 Upgrade-safe local memory provider for Hermes Agent.
 Hermes Agent 的升级安全本地记忆插件（sidecar memory provider）。
 
+Current version / 当前版本: **v1.1.0**
+
 ## Features
 
 - Read-only access to Hermes `state.db` via compatibility adapter
 - Sidecar indexing in `memory_index.sqlite`
 - Optional Graphiti recall/sync adapter
+- Optional Hindsight recall/retain adapter
 - Optional Reflector summary worker
+- Historical backfill to Hindsight with checkpoint + de-dup (`local_memory_hindsight_backfill`)
+- On-demand memory lane (`local_memory_ondemand_write` / `local_memory_ondemand_recall`)
+- Independent notes KB (`local_notes_kb_import` / `local_notes_kb_search` / `local_notes_kb_sync`)
 - NSFW tag preservation with configurable keyword lists
 - Upgrade compatibility check script
 
@@ -49,3 +55,8 @@ python3 ~/.hermes/tools/upgrade_check.py --config ~/.hermes/plugins/local_memory
 
 - 中文+English 详细“重新添加说明 + 目录结构”：  
   [docs/reinstall-and-structure.zh-en.md](docs/reinstall-and-structure.zh-en.md)
+
+## Changelog (CN + EN)
+
+- v1.1.0 release notes:  
+  [docs/changelog.zh-en.md](docs/changelog.zh-en.md)

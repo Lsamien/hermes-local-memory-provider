@@ -1,5 +1,7 @@
 # Local Memory Plugin Re-Add Guide (中文 + English)
 
+> Version / 版本: v1.1.0
+
 ## 1) 目标 / Goal
 
 中文：  
@@ -121,6 +123,21 @@ curl -sS http://127.0.0.1:8882/v1/default/banks
 检查目标 `bank_id`（如 `zhuer` / `yaoer`）是否在返回列表中。  
 Ensure target `bank_id` (e.g. `zhuer` / `yaoer`) exists in the response.
 
+### 4.4 历史回填到 Hindsight / Historical backfill into Hindsight
+
+v1.1.0 新增工具：`local_memory_hindsight_backfill`。  
+New in v1.1.0: `local_memory_hindsight_backfill`.
+
+用途 / Purpose:
+- 把 `local_memory` sidecar 中的历史对话补写到 Hindsight
+- 支持断点续传（checkpoint）
+- 支持去重（de-dup），避免重复 retain
+
+建议顺序 / Recommended flow:
+1. 先 dry-run：`{"dry_run": true, "max_items": 500}`
+2. 再正式回填：`{"dry_run": false, "max_items": 2000}`
+3. 全量重扫可加：`{"force": true}`
+
 ---
 
 ## 5) 仓库结构 / Repository Structure
@@ -131,6 +148,7 @@ hermes-local-memory-provider/
 │   └── local_memory/
 │       ├── __init__.py
 │       ├── compatibility_adapter.py
+│       ├── notes_kb.py
 │       ├── orchestrator.py
 │       └── plugin.yaml
 ├── memory/
@@ -150,6 +168,7 @@ hermes-local-memory-provider/
 ├── scripts/
 │   └── install.sh
 └── docs/
+    ├── changelog.zh-en.md
     ├── rollback-local-memory.md
     └── reinstall-and-structure.zh-en.md
 ```
@@ -159,6 +178,8 @@ hermes-local-memory-provider/
   只读访问 Hermes `state.db`，做字段兼容映射。
 - `plugins/local_memory/orchestrator.py`  
   记忆编排：sidecar 索引、Graphiti/Hindsight/Reflector 聚合。
+- `plugins/local_memory/notes_kb.py`  
+  独立笔记知识库导入/检索/增量同步（与对话记忆分离）。
 - `memory/graphiti/*`  
   Graphiti MCP 召回与异步写入适配。
 - `memory/reflector/*`  
@@ -178,6 +199,7 @@ hermes-local-memory-provider/
 │   └── local_memory/
 │       ├── __init__.py
 │       ├── compatibility_adapter.py
+│       ├── notes_kb.py
 │       ├── orchestrator.py
 │       ├── plugin.yaml
 │       └── config.yaml
@@ -185,9 +207,11 @@ hermes-local-memory-provider/
 │   ├── __init__.py
 │   ├── graphiti/
 │   ├── reflector/
-│   └── local_memory/
+│   ├── local_memory/
 │       ├── memory_index.sqlite      # sidecar memory index
 │       └── reflector.sqlite
+│   └── notes_kb/
+│       └── notes_kb.sqlite
 └── tools/
     └── upgrade_check.py
 ```
@@ -226,4 +250,3 @@ hermes-local-memory-provider/
 1. 还原 `~/.hermes/config.yaml` 备份  
 2. 重启 Hermes  
 3. sidecar 数据库保留（可按需清理）
-

@@ -26,6 +26,13 @@ recall:
   context_window_before: 3
   context_window_after: 3
 
+ingest:
+  allowed_roles:
+    - "user"
+    - "assistant"
+  drop_skill_invocation_messages: true
+  max_content_chars: 12000
+
 fts:
   enabled: true
   timeout_ms: 300
@@ -48,6 +55,67 @@ reflector:
   trigger_every_n_turns: 12
   prefetch_summaries: 1
   conflict_detection: true
+
+ondemand:
+  enabled: true
+  default_recall: false
+  explicit_query_only: true
+  max_results: 3
+  min_priority: 0
+  explicit_query_keywords:
+    - "回忆"
+    - "记得"
+    - "历史"
+    - "之前"
+    - "上次"
+    - "过去"
+    - "history"
+    - "remember"
+    - "recall"
+    - "context"
+
+notes_kb:
+  enabled: true
+  sqlite_path: "${HERMES_HOME}/memory/notes_kb/notes_kb.sqlite"
+  source_deletion_policy: "preserve" # preserve | soft_delete | hard_delete
+  chunk_chars: 700
+  overlap_chars: 120
+  search_default_limit: 6
+  include_extensions:
+    - ".md"
+    - ".txt"
+    - ".rst"
+    - ".py"
+    - ".js"
+    - ".ts"
+    - ".jsx"
+    - ".tsx"
+    - ".json"
+    - ".yaml"
+    - ".yml"
+    - ".toml"
+    - ".ini"
+    - ".cfg"
+    - ".conf"
+    - ".sh"
+    - ".bash"
+    - ".zsh"
+    - ".sql"
+    - ".go"
+    - ".rs"
+    - ".java"
+    - ".c"
+    - ".cpp"
+    - ".h"
+    - ".hpp"
+    - ".swift"
+    - ".kt"
+    - ".rb"
+    - ".php"
+    - ".css"
+    - ".scss"
+    - ".html"
+    - ".xml"
 
 nsfw:
   save: true
@@ -96,3 +164,16 @@ upgrade_safety:
   read_hermes_sqlite_only: true
   write_index_to_sidecar_sqlite: true
   compatibility_adapter_required: true
+
+hindsight:
+  enabled: false
+  mode: local_external
+  api_url: "http://127.0.0.1:8882"
+  api_key: ""
+  bank_id: "default"
+  recall_budget: mid
+  recall_method: recall # recall | reflect
+  recall_max_results: 4
+  retain_async: true
+  retain_every_n_turns: 1
+  timeout_ms: 8000

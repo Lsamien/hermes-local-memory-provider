@@ -5,7 +5,6 @@ import argparse
 import importlib
 import importlib.util
 import json
-import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -132,13 +131,10 @@ def check_graphiti_endpoint(endpoint: str, timeout: float = 2.5) -> Tuple[bool, 
 
 
 def main() -> int:
-    hermes_home = Path(
-        os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
-    ).expanduser().resolve()
     parser = argparse.ArgumentParser(description="Hermes local-memory upgrade compatibility check")
     parser.add_argument(
         "--config",
-        default=str(hermes_home / "plugins" / "local_memory" / "config.yaml"),
+        default="/Users/samien/.hermes/plugins/local_memory/config.yaml",
         help="Path to local-memory config.yaml",
     )
     args = parser.parse_args()
@@ -154,6 +150,7 @@ def main() -> int:
         result.add("FAIL", f"Config load failed: {exc}")
         return result.final_code()
 
+    hermes_home = Path("/Users/samien/.hermes")
     ensure_sys_path(hermes_home)
 
     hermes_sqlite = Path(str(cfg.get("hermes", {}).get("sqlite_path", ""))).expanduser().resolve()
