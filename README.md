@@ -1,6 +1,7 @@
 # hermes-local-memory-provider
 
 Upgrade-safe local memory provider for Hermes Agent.
+Hermes Agent 的升级安全本地记忆插件（sidecar memory provider）。
 
 ## Features
 
@@ -43,3 +44,8 @@ python3 ~/.hermes/tools/upgrade_check.py --config ~/.hermes/plugins/local_memory
 
 - This project never alters Hermes core SQLite schema.
 - All new writes are sidecar-only.
+
+## Re-Add Guide (CN + EN)
+
+- 中文+English 详细“重新添加说明 + 目录结构”：  
+  [docs/reinstall-and-structure.zh-en.md](docs/reinstall-and-structure.zh-en.md)
