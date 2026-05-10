@@ -1,6 +1,6 @@
 # Local Memory Plugin Re-Add Guide (中文 + English)
 
-> Version / 版本: v1.2.0
+> Version / 版本: v1.3.0
 
 ## 1) 目标 / Goal
 
@@ -18,13 +18,15 @@ This document explains how to re-add the `local_memory` plugin and provides both
 - Hermes 已安装，默认目录：`~/.hermes`
 - 本仓库已拉取到本地：`~/git/hermes-local-memory-provider`
 - 若启用 Hindsight（`local_external`），请确保 API 可访问（常见为 `http://127.0.0.1:8882`）
-- 若启用 Mem0，请确保 Mem0 API 可访问（常见为 `http://127.0.0.1:18888`）
+- 若 Mem0 使用 HTTP 模式，请确保 Mem0 API 可访问（常见为 `http://127.0.0.1:18888`）
+- 若 Mem0 使用本地模式（`local_only`），无需 Docker Mem0，但需本地 Python 依赖与 Ollama embedding 模型准备完毕
 
 English:
 - Hermes is installed (default home: `~/.hermes`)
 - This repo is cloned locally at `~/git/hermes-local-memory-provider`
 - If Hindsight is enabled in `local_external` mode, ensure the API is reachable (commonly `http://127.0.0.1:8882`)
-- If Mem0 is enabled, ensure Mem0 API is reachable (commonly `http://127.0.0.1:18888`)
+- If Mem0 uses HTTP mode, ensure Mem0 API is reachable (commonly `http://127.0.0.1:18888`)
+- If Mem0 uses local mode (`local_only`), Mem0 Docker is not required, but local Python deps and Ollama embedding model must be ready
 
 ---
 
@@ -159,6 +161,32 @@ New in v1.2.0: `local_memory_mem0_backfill`.
 1. 先 dry-run：`{"dry_run": true, "max_items": 500}`
 2. 再正式回填：`{"dry_run": false, "max_items": 2000}`
 3. 全量重扫可加：`{"force": true}`
+
+### 4.6 Mem0 本地优先模式 / Mem0 local-only mode
+
+如果你不希望启动 Mem0 Docker，可使用 `local_only`：  
+If you do not want to run Mem0 Docker, use `local_only`:
+
+```yaml
+mem0:
+  enabled: true
+  api_url: ""
+  fallback_mode: local_only
+  local_backend:
+    enabled: true
+    llm_provider: openai
+    llm_base_url: http://127.0.0.1:3000/grok-web/v1
+    llm_model: grok-4.20-fast
+    llm_api_key: local-placeholder
+    embedder_provider: ollama
+    embedder_model: bge-m3
+    embedding_dims: 1024
+    embedder_base_url: http://127.0.0.1:11434
+```
+
+更多详细说明：  
+See full guide:  
+`docs/mem0-local-only.zh-en.md`
 
 ---
 

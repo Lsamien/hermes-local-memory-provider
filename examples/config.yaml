@@ -166,12 +166,13 @@ upgrade_safety:
   compatibility_adapter_required: true
 
 mem0:
-  enabled: false
-  api_url: "http://127.0.0.1:18888"
+  enabled: true
+  api_url: ""
   api_key: ""
   user_id: "default"
   timeout_ms: 6000
   recall_max_results: 3
+  fallback_mode: "local_only" # http_only | local_only | http_then_local | local_then_http
   explicit_query_only: true
   explicit_query_keywords:
     - "回忆"
@@ -185,6 +186,20 @@ mem0:
     - "memory"
   retain_async: true
   live_max_content_chars: 3000
+  local_backend:
+    enabled: true
+    llm_provider: "openai"
+    llm_base_url: "http://127.0.0.1:3000/grok-web/v1"
+    llm_model: "grok-4.20-fast"
+    llm_api_key: "local-placeholder"
+    embedder_provider: "ollama"
+    embedder_model: "bge-m3"
+    embedding_dims: 1024
+    vector_store_provider: "qdrant"
+    storage_path: "${HERMES_HOME}/memory/local_memory/mem0_local_qdrant"
+    collection_name: "mem0_local_default_bgem3_1024"
+    embedder_api_key: ""
+    embedder_base_url: "http://127.0.0.1:11434"
 
 hindsight:
   enabled: false

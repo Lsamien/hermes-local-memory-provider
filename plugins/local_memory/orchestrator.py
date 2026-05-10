@@ -84,6 +84,266 @@ class _Mem0HTTPClient:
         return self._request_json("POST", "/search", payload)
 
 
+class _Mem0LocalClient:
+    """Best-effort Mem0 OSS library adapter.
+
+    This keeps runtime resilient when Mem0 HTTP API is unavailable.
+    """
+
+    def __init__(self, local_cfg: Dict[str, Any], timeout_s: float):
+        self.local_cfg = local_cfg
+        self.timeout_s = max(1.0, float(timeout_s))
+        self._memory: Optional[Any] = None
+        self._init_error = ""
+
+    def _build_config_dict(self) -> Dict[str, Any]:
+        custom = self.local_cfg.get("config_dict")
+        if isinstance(custom, dict) and custom:
+            return custom
+
+        cfg: Dict[str, Any] = {}
+        llm_provider = str(
+            self.local_cfg.get("llm_provider")
+            or self.local_cfg.get("model_provider")
+            or ""
+        ).strip()
+        llm_provider_alias = {
+            "openai_compatible": "openai",
+            "openai-compatible": "openai",
+        }
+        llm_provider = llm_provider_alias.get(llm_provider.lower(), llm_provider)
+        llm_model = str(self.local_cfg.get("llm_model") or "").strip()
+        llm_base_url = str(self.local_cfg.get("llm_base_url") or "").strip()
+        llm_api_key = str(self.local_cfg.get("llm_api_key") or "").strip()
+        if llm_provider.lower() == "openai" and not llm_api_key:
+            # OpenAI-compatible gateways still require a non-empty key field.
+            llm_api_key = "local-placeholder"
+
+        if llm_provider:
+            llm_cfg: Dict[str, Any] = {"provider": llm_provider}
+            llm_inner: Dict[str, Any] = {}
+            if llm_model:
+                llm_inner["model"] = llm_model
+            if llm_base_url:
+                provider_key = llm_provider.lower()
+                if provider_key == "openai":
+                    llm_inner["openai_base_url"] = llm_base_url
+                elif provider_key in {"xai", "x.ai"}:
+                    # mem0's xai config does not currently expose xai_base_url on BaseLlmConfig.
+                    # We pass this via XAI_API_BASE env var in _ensure_memory().
+                    pass
+                elif provider_key == "ollama":
+                    llm_inner["ollama_base_url"] = llm_base_url
+                else:
+                    llm_inner["base_url"] = llm_base_url
+            if llm_api_key:
+                llm_inner["api_key"] = llm_api_key
+            if llm_inner:
+                llm_cfg["config"] = llm_inner
+            cfg["llm"] = llm_cfg
+
+        embedder_provider = str(
+            self.local_cfg.get("embedder_provider") or "huggingface"
+        ).strip()
+        embedder_model = str(self.local_cfg.get("embedder_model") or "").strip()
+        embedder_api_key = str(self.local_cfg.get("embedder_api_key") or "").strip()
+        embedder_base_url = str(self.local_cfg.get("embedder_base_url") or "").strip()
+        if embedder_model:
+            emb_cfg: Dict[str, Any] = {"provider": embedder_provider}
+            emb_inner: Dict[str, Any] = {"model": embedder_model}
+            if embedder_api_key:
+                emb_inner["api_key"] = embedder_api_key
+            if embedder_base_url:
+                e_provider = embedder_provider.lower()
+                if e_provider == "openai":
+                    emb_inner["openai_base_url"] = embedder_base_url
+                elif e_provider == "huggingface":
+                    emb_inner["huggingface_base_url"] = embedder_base_url
+                elif e_provider == "ollama":
+                    emb_inner["ollama_base_url"] = embedder_base_url
+                else:
+                    emb_inner["base_url"] = embedder_base_url
+            emb_cfg["config"] = emb_inner
+            cfg["embedder"] = emb_cfg
+
+        vector_provider = str(
+            self.local_cfg.get("vector_store_provider") or "qdrant"
+        ).strip().lower()
+        vector_path = str(self.local_cfg.get("storage_path") or "").strip()
+        vector_collection = str(
+            self.local_cfg.get("collection_name") or "mem0_local"
+        ).strip()
+        vector_dims = int(self.local_cfg.get("embedding_dims", 0) or 0)
+        if vector_provider:
+            vector_cfg: Dict[str, Any] = {"provider": vector_provider, "config": {}}
+            if vector_provider == "qdrant":
+                if vector_path:
+                    vector_cfg["config"]["path"] = vector_path
+                if vector_collection:
+                    vector_cfg["config"]["collection_name"] = vector_collection
+                if vector_dims > 0:
+                    vector_cfg["config"]["embedding_model_dims"] = vector_dims
+            if vector_cfg["config"]:
+                cfg["vector_store"] = vector_cfg
+
+        return cfg
+
+    @staticmethod
+    def _call_with_variants(fn: Any, variants: List[Dict[str, Any]]) -> Any:
+        last_exc: Optional[Exception] = None
+        for kwargs in variants:
+            try:
+                return fn(**kwargs)
+            except TypeError as exc:
+                last_exc = exc
+                continue
+        if last_exc is not None:
+            raise last_exc
+        return fn()
+
+    def _ensure_memory(self) -> Any:
+        if self._memory is not None:
+            return self._memory
+
+        from mem0 import Memory  # type: ignore
+
+        llm_provider = str(
+            self.local_cfg.get("llm_provider")
+            or self.local_cfg.get("model_provider")
+            or ""
+        ).strip().lower()
+        llm_base_url = str(self.local_cfg.get("llm_base_url") or "").strip()
+        llm_api_key = str(self.local_cfg.get("llm_api_key") or "").strip()
+        if llm_provider in {"xai", "x.ai"}:
+            if llm_base_url:
+                os.environ.setdefault("XAI_API_BASE", llm_base_url)
+            if llm_api_key:
+                os.environ.setdefault("XAI_API_KEY", llm_api_key)
+        elif llm_provider == "openai":
+            if llm_base_url:
+                os.environ.setdefault("OPENAI_BASE_URL", llm_base_url)
+            if llm_api_key:
+                os.environ.setdefault("OPENAI_API_KEY", llm_api_key)
+
+        config_dict = self._build_config_dict()
+        variants = []
+        if config_dict:
+            variants.extend(
+                [
+                    {"config_dict": config_dict},
+                    {"config": config_dict},
+                ]
+            )
+        variants.append({})
+
+        last_exc: Optional[Exception] = None
+        if hasattr(Memory, "from_config"):
+            for kwargs in variants:
+                try:
+                    self._memory = Memory.from_config(**kwargs)
+                    return self._memory
+                except Exception as exc:
+                    last_exc = exc
+        for kwargs in variants:
+            try:
+                if kwargs:
+                    self._memory = Memory(**kwargs)
+                else:
+                    self._memory = Memory()
+                return self._memory
+            except Exception as exc:
+                last_exc = exc
+
+        msg = str(last_exc) if last_exc else "mem0 local init failed"
+        self._init_error = msg
+        raise RuntimeError(msg)
+
+    def ping(self) -> tuple[bool, str]:
+        try:
+            self._ensure_memory()
+            return True, "ok"
+        except Exception as exc:
+            self._init_error = str(exc)
+            return False, self._init_error or "init_failed"
+
+    def add_memory(
+        self,
+        *,
+        messages: List[Dict[str, str]],
+        user_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        memory = self._ensure_memory()
+        add_fn = getattr(memory, "add", None)
+        if not callable(add_fn):
+            raise RuntimeError("mem0 local client has no add()")
+
+        text_payload = "\n".join(
+            f"{m.get('role', 'user')}: {m.get('content', '')}".strip() for m in messages
+        ).strip()
+
+        def _variants(infer_flag: Optional[bool]) -> List[Dict[str, Any]]:
+            base = [
+                {"messages": messages, "user_id": user_id, "metadata": metadata or {}},
+                {"messages": messages, "user_id": user_id},
+                {"messages": messages, "filters": {"user_id": user_id}, "metadata": metadata or {}},
+                {"messages": messages, "filters": {"user_id": user_id}},
+                {"text": text_payload, "user_id": user_id, "metadata": metadata or {}},
+                {"text": text_payload, "user_id": user_id},
+                {"text": text_payload, "filters": {"user_id": user_id}, "metadata": metadata or {}},
+                {"text": text_payload, "filters": {"user_id": user_id}},
+            ]
+            if infer_flag is None:
+                return base
+            out: List[Dict[str, Any]] = []
+            for item in base:
+                tmp = dict(item)
+                tmp["infer"] = infer_flag
+                out.append(tmp)
+            return out
+
+        result: Any = None
+        try:
+            result = self._call_with_variants(add_fn, _variants(True))
+        except Exception:
+            result = self._call_with_variants(add_fn, _variants(False))
+        else:
+            if isinstance(result, dict):
+                rows = result.get("results", None)
+                if isinstance(rows, list) and not rows:
+                    result = self._call_with_variants(add_fn, _variants(False))
+
+        if isinstance(result, dict):
+            return result
+        return {"raw": result}
+
+    def search(
+        self,
+        *,
+        query: str,
+        user_id: str,
+        top_k: int,
+    ) -> Dict[str, Any]:
+        memory = self._ensure_memory()
+        search_fn = getattr(memory, "search", None)
+        if not callable(search_fn):
+            raise RuntimeError("mem0 local client has no search()")
+
+        k = max(1, min(int(top_k), 20))
+        variants = [
+            {"query": query, "filters": {"user_id": user_id}, "top_k": k},
+            {"query": query, "filters": {"user_id": user_id}, "limit": k},
+            {"query": query, "user_id": user_id, "top_k": k},
+            {"query": query, "user_id": user_id, "limit": k},
+        ]
+        result = self._call_with_variants(search_fn, variants)
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, list):
+            return {"results": result}
+        return {"raw": result}
+
+
 class MemoryOrchestrator:
     """Business logic for local memory ingestion and recall.
 
@@ -167,7 +427,7 @@ class MemoryOrchestrator:
 
         mem0_cfg = config.get("mem0", {})
         self.mem0_enabled = bool(mem0_cfg.get("enabled", False))
-        self._mem0_client: Optional[_Mem0HTTPClient] = None
+        self._mem0_client: Optional[Any] = None
         self._mem0_api_url = str(
             mem0_cfg.get("api_url") or os.environ.get("MEM0_API_URL", "")
         ).strip() or "http://127.0.0.1:18888"
@@ -182,6 +442,23 @@ class MemoryOrchestrator:
             300,
             int(mem0_cfg.get("live_max_content_chars", 3000) or 3000),
         )
+        self._mem0_fallback_mode = str(
+            mem0_cfg.get("fallback_mode", "http_only")
+        ).strip().lower()
+        if self._mem0_fallback_mode not in {
+            "http_only",
+            "local_only",
+            "http_then_local",
+            "local_then_http",
+        }:
+            self._mem0_fallback_mode = "http_only"
+        local_cfg = mem0_cfg.get("local_backend", {})
+        if not isinstance(local_cfg, dict):
+            local_cfg = {}
+        self._mem0_local_cfg = local_cfg
+        self._mem0_local_enabled = bool(local_cfg.get("enabled", False))
+        self._mem0_local_client: Optional[_Mem0LocalClient] = None
+        self._mem0_active_backend = "none"
         self._mem0_user_id = str(mem0_cfg.get("user_id", "")).strip()
         self._mem0_query_keywords = self._normalize_keyword_list(
             mem0_cfg.get("explicit_query_keywords", [])
@@ -435,21 +712,7 @@ class MemoryOrchestrator:
                         or graphiti_group
                         or "default"
                     )
-                client = _Mem0HTTPClient(
-                    api_url=self._mem0_api_url,
-                    api_key=self._mem0_api_key,
-                    timeout_s=self._mem0_timeout_s,
-                )
-                ok, detail = client.ping()
-                if ok:
-                    self._mem0_client = client
-                    logger.info(
-                        "Mem0 client initialized (api_url=%s, user_id=%s)",
-                        self._mem0_api_url,
-                        self._mem0_user_id,
-                    )
-                else:
-                    logger.warning("Mem0 init failed (unreachable): %s", detail)
+                self._init_mem0_backend()
             except Exception as exc:
                 logger.warning("Mem0 init failed (non-fatal): %s", exc)
                 self._mem0_client = None
@@ -1319,14 +1582,102 @@ class MemoryOrchestrator:
                 rules.append((token, None))
         return rules
 
+    def _init_mem0_backend(self) -> None:
+        self._mem0_client = None
+        self._mem0_active_backend = "none"
+
+        mode = self._mem0_fallback_mode
+        if mode == "local_only":
+            self._try_init_mem0_local()
+            return
+        if mode == "local_then_http":
+            if self._try_init_mem0_local():
+                return
+            self._try_init_mem0_http()
+            return
+        if mode == "http_then_local":
+            if self._try_init_mem0_http():
+                return
+            self._try_init_mem0_local()
+            return
+        self._try_init_mem0_http()
+
+    def _try_init_mem0_http(self) -> bool:
+        try:
+            client = _Mem0HTTPClient(
+                api_url=self._mem0_api_url,
+                api_key=self._mem0_api_key,
+                timeout_s=self._mem0_timeout_s,
+            )
+            ok, detail = client.ping()
+            if ok:
+                self._mem0_client = client
+                self._mem0_active_backend = "http"
+                logger.info(
+                    "Mem0 client initialized (backend=http, api_url=%s, user_id=%s)",
+                    self._mem0_api_url,
+                    self._mem0_user_id,
+                )
+                return True
+            logger.warning("Mem0 HTTP init failed (unreachable): %s", detail)
+            return False
+        except Exception as exc:
+            logger.warning("Mem0 HTTP init failed (non-fatal): %s", exc)
+            return False
+
+    def _try_init_mem0_local(self) -> bool:
+        if not self._mem0_local_enabled:
+            logger.info("Mem0 local backend disabled by config")
+            return False
+        try:
+            if self._mem0_local_client is None:
+                self._mem0_local_client = _Mem0LocalClient(
+                    local_cfg=self._mem0_local_cfg,
+                    timeout_s=self._mem0_timeout_s,
+                )
+            ok, detail = self._mem0_local_client.ping()
+            if ok:
+                self._mem0_client = self._mem0_local_client
+                self._mem0_active_backend = "local"
+                logger.info(
+                    "Mem0 client initialized (backend=local, user_id=%s)",
+                    self._mem0_user_id,
+                )
+                return True
+            logger.warning("Mem0 local init failed (unreachable): %s", detail)
+            return False
+        except Exception as exc:
+            logger.warning("Mem0 local init failed (non-fatal): %s", exc)
+            return False
+
+    def _maybe_failover_mem0(self, exc: Exception) -> bool:
+        mode = self._mem0_fallback_mode
+        if self._mem0_active_backend == "http" and mode == "http_then_local":
+            logger.warning("Mem0 HTTP failed, trying local fallback: %s", exc)
+            return self._try_init_mem0_local()
+        if self._mem0_active_backend == "local" and mode == "local_then_http":
+            logger.warning("Mem0 local failed, trying HTTP fallback: %s", exc)
+            return self._try_init_mem0_http()
+        return False
+
     def _mem0_query(self, query: str) -> List[str]:
         if not self._mem0_client:
             return []
-        response = self._mem0_client.search(
-            query=str(query or ""),
-            user_id=self._mem0_user_id or "default",
-            top_k=self._mem0_recall_max_results,
-        )
+        try:
+            response = self._mem0_client.search(
+                query=str(query or ""),
+                user_id=self._mem0_user_id or "default",
+                top_k=self._mem0_recall_max_results,
+            )
+        except Exception as exc:
+            if self._maybe_failover_mem0(exc) and self._mem0_client:
+                response = self._mem0_client.search(
+                    query=str(query or ""),
+                    user_id=self._mem0_user_id or "default",
+                    top_k=self._mem0_recall_max_results,
+                )
+            else:
+                raise
         rows = response.get("results", [])
         if not isinstance(rows, list):
             return []
@@ -1383,11 +1734,21 @@ class MemoryOrchestrator:
             return {"retained": False, "duplicate": False}
 
         try:
-            self._mem0_client.add_memory(
-                messages=messages,
-                user_id=self._mem0_user_id or "default",
-                metadata=metadata,
-            )
+            try:
+                self._mem0_client.add_memory(
+                    messages=messages,
+                    user_id=self._mem0_user_id or "default",
+                    metadata=metadata,
+                )
+            except Exception as exc:
+                if self._maybe_failover_mem0(exc) and self._mem0_client:
+                    self._mem0_client.add_memory(
+                        messages=messages,
+                        user_id=self._mem0_user_id or "default",
+                        metadata=metadata,
+                    )
+                else:
+                    raise
         except Exception:
             with self._connect_index() as conn:
                 conn.execute("DELETE FROM mem0_retain_log WHERE retain_hash = ?", (retain_hash,))

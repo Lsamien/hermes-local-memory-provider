@@ -1,5 +1,39 @@
 # Changelog / 更新日志
 
+## v1.3.0 (2026-05-10)
+
+### 中文
+- 新增 Mem0 本地库适配（`_Mem0LocalClient`），支持无 Docker 的本地 retain/recall。
+- 新增 Mem0 后端模式：
+  - `http_only`
+  - `local_only`
+  - `http_then_local`
+  - `local_then_http`
+- 新增 Mem0 故障自动切换逻辑（HTTP/Local 双向切换）。
+- 新增本地写入 `infer=false` 二次兜底，降低上游 LLM 抽取失败导致的空写入风险。
+- 新增本地向量库配置项（`vector_store_provider`、`storage_path`、`collection_name`、`embedding_dims`）以避免维度冲突。
+- 安装脚本增强：
+  - 自动设置 `memory.provider=local_memory`
+  - 自动设置 `memory.local_memory.config_path`
+  - 支持 `HERMES_PROFILES` 批量安装到多 profile
+- 文档增强：新增 `docs/mem0-local-only.zh-en.md`，补充“本地优先（无 Docker）”完整手册。
+
+### English
+- Added Mem0 local library adapter (`_Mem0LocalClient`) for Docker-free local retain/recall.
+- Added Mem0 backend modes:
+  - `http_only`
+  - `local_only`
+  - `http_then_local`
+  - `local_then_http`
+- Added automatic Mem0 failover between HTTP and local backends.
+- Added `infer=false` second-pass fallback for local writes to reduce empty-write risk when upstream LLM extraction fails.
+- Added local vector store config knobs (`vector_store_provider`, `storage_path`, `collection_name`, `embedding_dims`) to avoid embedding dimension conflicts.
+- Enhanced installer:
+  - Auto sets `memory.provider=local_memory`
+  - Auto sets `memory.local_memory.config_path`
+  - Supports multi-profile install via `HERMES_PROFILES`
+- Documentation enhancement: added `docs/mem0-local-only.zh-en.md` with full local-first (no-Docker) runbook.
+
 ## v1.2.0 (2026-05-10)
 
 ### 中文
