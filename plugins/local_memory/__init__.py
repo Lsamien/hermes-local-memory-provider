@@ -264,6 +264,46 @@ LOCAL_MEMORY_HINDSIGHT_BACKFILL_SCHEMA: Dict[str, Any] = {
     },
 }
 
+LOCAL_MEMORY_MEM0_BACKFILL_SCHEMA: Dict[str, Any] = {
+    "name": "local_memory_mem0_backfill",
+    "description": (
+        "Backfill historical local_memory turns into Mem0 with checkpoint and de-dup."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "max_items": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5000,
+                "description": "Maximum historical rows to scan in this run.",
+            },
+            "from_turn_id": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Optional explicit start turn id (exclusive).",
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Optional session id filter.",
+            },
+            "include_nsfw": {
+                "type": "boolean",
+                "description": "Whether NSFW-tagged rows are included in backfill.",
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "If true, only scan and estimate without writing to Mem0.",
+            },
+            "force": {
+                "type": "boolean",
+                "description": "If true, ignore saved checkpoint and start from 0 unless from_turn_id is set.",
+            },
+        },
+        "required": [],
+    },
+}
+
 
 class LocalMemoryProvider(MemoryProvider):
     def __init__(self):
@@ -321,6 +361,7 @@ class LocalMemoryProvider(MemoryProvider):
             LOCAL_NOTES_KB_SYNC_SCHEMA,
             LOCAL_NOTES_KB_STATUS_SCHEMA,
             LOCAL_MEMORY_HINDSIGHT_BACKFILL_SCHEMA,
+            LOCAL_MEMORY_MEM0_BACKFILL_SCHEMA,
         ]
 
     def system_prompt_block(self) -> str:
@@ -332,9 +373,11 @@ class LocalMemoryProvider(MemoryProvider):
             "Core Hermes SQLite remains read-only for this provider.\n"
             "For non-core/optional memories, use local_memory_ondemand_write. "
             "When users ask for prior optional details, use local_memory_ondemand_recall.\n"
+            "Mem0 bridge is enabled for semantic long-term memory retain/recall when configured.\n"
             "For software/programming documents and notes, use local_notes_kb_import / "
             "local_notes_kb_search against the independent notes KB. "
-            "When historical memory must be imported into Hindsight, use local_memory_hindsight_backfill."
+            "When historical memory must be imported into Hindsight, use local_memory_hindsight_backfill. "
+            "When historical memory must be imported into Mem0, use local_memory_mem0_backfill."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -496,6 +539,17 @@ class LocalMemoryProvider(MemoryProvider):
                     force=bool(args.get("force", False)),
                 )
                 return json.dumps(result, ensure_ascii=False)
+
+            if tool_name == "local_memory_mem0_backfill":
+                result = self._orchestrator.mem0_backfill(
+                    max_items=int(args.get("max_items", 500)),
+                    from_turn_id=int(args.get("from_turn_id")) if args.get("from_turn_id") is not None else None,
+                    session_id=str(args.get("session_id", "")).strip(),
+                    include_nsfw=bool(args.get("include_nsfw", True)),
+                    dry_run=bool(args.get("dry_run", False)),
+                    force=bool(args.get("force", False)),
+                )
+                return json.dumps(result, ensure_ascii=False)
         except Exception as exc:
             logger.warning("local_memory tool call failed (%s): %s", tool_name, exc)
             if not self._fail_open:
@@ -541,6 +595,9 @@ class LocalMemoryProvider(MemoryProvider):
         hindsight_override = memory_root_cfg.get("hindsight")
         if isinstance(hindsight_override, dict):
             cfg["hindsight"] = _deep_merge_dict(cfg.get("hindsight", {}) or {}, hindsight_override)
+        mem0_override = memory_root_cfg.get("mem0")
+        if isinstance(mem0_override, dict):
+            cfg["mem0"] = _deep_merge_dict(cfg.get("mem0", {}) or {}, mem0_override)
 
         return cfg
 

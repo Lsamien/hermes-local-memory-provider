@@ -1,5 +1,5 @@
 name: local_memory
-version: 1.1.0
+version: 1.2.0
 description: "Local sidecar memory provider with upgrade-safe compatibility adapter (read-only Hermes SQLite + writable sidecar index)."
 requires_env: []
 pip_dependencies:

@@ -1,5 +1,23 @@
 # Changelog / 更新日志
 
+## v1.2.0 (2026-05-10)
+
+### 中文
+- 新增 Mem0 实时桥接：支持在 `local_memory` 中进行 Mem0 retain/recall（可配置显式召回关键词）。
+- 新增 Mem0 历史回填工具：`local_memory_mem0_backfill`（支持 checkpoint、去重、dry-run、force）。
+- 新增 `memory.mem0` root 配置覆盖合并逻辑，便于按 profile 隔离 `user_id`。
+- 增强 Hindsight 稳定性：修复现代客户端在异步/跨线程场景下常见的 `Timeout context manager should be used inside a task` 问题（线程兼容重建 + retain_batch 路径）。
+- 增强 NSFW 关键词策略：英文关键词采用词边界匹配，降低误判；保留“可保存、不删除”策略。
+- 增加写入内容长度裁剪保护，避免超长内容在回填/实时写入中导致不稳定。
+
+### English
+- Added live Mem0 bridge in `local_memory` with Mem0 retain/recall (including explicit-recall keyword control).
+- Added Mem0 historical backfill tool: `local_memory_mem0_backfill` (checkpoint, de-dup, dry-run, force).
+- Added root `memory.mem0` override merge support for easier profile-level `user_id` isolation.
+- Improved Hindsight reliability for modern client async/thread cases, including mitigation for `Timeout context manager should be used inside a task` (thread-compat rebuild + retain_batch path).
+- Improved NSFW keyword policy: boundary-based matching for English keywords to reduce false positives while keeping preserve-first behavior.
+- Added content-length clipping safeguards for live retain and backfill stability.
+
 ## v1.1.0 (2026-05-09)
 
 ### 中文

@@ -165,6 +165,27 @@ upgrade_safety:
   write_index_to_sidecar_sqlite: true
   compatibility_adapter_required: true
 
+mem0:
+  enabled: false
+  api_url: "http://127.0.0.1:18888"
+  api_key: ""
+  user_id: "default"
+  timeout_ms: 6000
+  recall_max_results: 3
+  explicit_query_only: true
+  explicit_query_keywords:
+    - "回忆"
+    - "记得"
+    - "历史"
+    - "上次"
+    - "之前"
+    - "remember"
+    - "recall"
+    - "history"
+    - "memory"
+  retain_async: true
+  live_max_content_chars: 3000
+
 hindsight:
   enabled: false
   mode: local_external

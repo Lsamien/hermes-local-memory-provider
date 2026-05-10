@@ -7,6 +7,8 @@ import os
 import re
 import sqlite3
 import threading
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -14,6 +16,72 @@ from typing import Any, Dict, List, Optional
 from .compatibility_adapter import HermesSQLiteCompatibilityAdapter
 
 logger = logging.getLogger(__name__)
+
+
+class _Mem0HTTPClient:
+    def __init__(self, api_url: str, api_key: str, timeout_s: float):
+        self.api_url = api_url.rstrip("/")
+        self.api_key = api_key.strip()
+        self.timeout_s = max(1.0, float(timeout_s))
+
+    def _request_json(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        url = f"{self.api_url}{path}"
+        data = None
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url=url, data=data, headers=headers, method=method.upper())
+        with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+            raw = resp.read().decode("utf-8")
+        if not raw.strip():
+            return {}
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                return obj
+            return {"raw": obj}
+        except Exception:
+            return {"raw": raw}
+
+    def ping(self) -> tuple[bool, str]:
+        try:
+            self._request_json("GET", "/configure")
+            return True, "ok"
+        except urllib.error.HTTPError as exc:
+            return False, f"http_{exc.code}"
+        except Exception as exc:
+            return False, str(exc)
+
+    def add_memory(
+        self,
+        *,
+        messages: List[Dict[str, str]],
+        user_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "messages": messages,
+            "user_id": user_id,
+        }
+        if metadata:
+            payload["metadata"] = metadata
+        return self._request_json("POST", "/memories", payload)
+
+    def search(
+        self,
+        *,
+        query: str,
+        user_id: str,
+        top_k: int,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "query": query,
+            "filters": {"user_id": user_id},
+            "top_k": max(1, min(int(top_k), 20)),
+        }
+        return self._request_json("POST", "/search", payload)
 
 
 class MemoryOrchestrator:
@@ -83,7 +151,53 @@ class MemoryOrchestrator:
         self._hindsight_budget = str(hindsight_cfg.get("recall_budget", "mid")).strip() or "mid"
         self._hindsight_mode = str(hindsight_cfg.get("mode", "local_external")).strip()
         self._hindsight_client_flavor = ""
+        self._hindsight_api_url = ""
+        self._hindsight_api_key = ""
+        self._hindsight_client_thread_id: Optional[int] = None
+        self._hindsight_retain_server_async = bool(hindsight_cfg.get("retain_server_async", True))
+        self._hindsight_backfill_max_chars = max(
+            500,
+            int(hindsight_cfg.get("backfill_max_content_chars", 2500) or 2500),
+        )
+        self._hindsight_live_max_chars = max(
+            500,
+            int(hindsight_cfg.get("live_max_content_chars", 4000) or 4000),
+        )
         # End Hindsight integration
+
+        mem0_cfg = config.get("mem0", {})
+        self.mem0_enabled = bool(mem0_cfg.get("enabled", False))
+        self._mem0_client: Optional[_Mem0HTTPClient] = None
+        self._mem0_api_url = str(
+            mem0_cfg.get("api_url") or os.environ.get("MEM0_API_URL", "")
+        ).strip() or "http://127.0.0.1:18888"
+        self._mem0_api_key = str(
+            mem0_cfg.get("api_key") or os.environ.get("MEM0_API_KEY", "")
+        ).strip()
+        self._mem0_timeout_s = max(1.0, int(mem0_cfg.get("timeout_ms", 6000)) / 1000)
+        self._mem0_recall_max_results = int(mem0_cfg.get("recall_max_results", 3))
+        self._mem0_require_explicit_query = bool(mem0_cfg.get("explicit_query_only", True))
+        self._mem0_retain_async = bool(mem0_cfg.get("retain_async", True))
+        self._mem0_live_max_chars = max(
+            300,
+            int(mem0_cfg.get("live_max_content_chars", 3000) or 3000),
+        )
+        self._mem0_user_id = str(mem0_cfg.get("user_id", "")).strip()
+        self._mem0_query_keywords = self._normalize_keyword_list(
+            mem0_cfg.get("explicit_query_keywords", [])
+        )
+        if not self._mem0_query_keywords:
+            self._mem0_query_keywords = [
+                "回忆",
+                "记得",
+                "历史",
+                "上次",
+                "之前",
+                "remember",
+                "recall",
+                "history",
+                "memory",
+            ]
 
         ondemand_cfg = config.get("ondemand", {})
         self.ondemand_enabled = bool(ondemand_cfg.get("enabled", True))
@@ -117,6 +231,7 @@ class MemoryOrchestrator:
         )
         self._nsfw_keywords = self._build_nsfw_keywords(nsfw_cfg)
         self._nsfw_query_keywords = self._build_nsfw_query_keywords(nsfw_cfg, self._nsfw_keywords)
+        self._nsfw_keyword_rules = self._compile_nsfw_keyword_rules(self._nsfw_keywords)
 
     def initialize(self) -> None:
         self.adapter.validate_schema()
@@ -163,6 +278,25 @@ class MemoryOrchestrator:
                     bank_id TEXT NOT NULL,
                     source_key TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mem0_retain_log (
+                    retain_hash TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mem0_state (
+                    user_id TEXT PRIMARY KEY,
+                    last_backfill_turn_id INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
                 )
                 """
             )
@@ -239,6 +373,8 @@ class MemoryOrchestrator:
                     api_url = "http://127.0.0.1:8882"
                 if not api_url:
                     raise ValueError("hindsight api_url is empty")
+                self._hindsight_api_url = api_url
+                self._hindsight_api_key = api_key
 
                 try:
                     # Older adapter API.
@@ -262,6 +398,18 @@ class MemoryOrchestrator:
                         kwargs["api_key"] = api_key
                     self._hindsight_client = Hindsight(**kwargs)
                     self._hindsight_client_flavor = "modern"
+                    self._hindsight_client_thread_id = threading.get_ident()
+                    # Modern hindsight-client internally uses aiohttp sessions bound
+                    # to an event loop. Background thread writes can cross loop/thread
+                    # boundaries and raise:
+                    # "Timeout context manager should be used inside a task".
+                    # Force synchronous retain for modern client to keep loop affinity stable.
+                    if self._hindsight_retain_async:
+                        logger.info(
+                            "Hindsight modern client detected; forcing retain_async=false "
+                            "to avoid cross-thread event-loop/session issues."
+                        )
+                        self._hindsight_retain_async = False
                     self._ensure_hindsight_bank()
 
                 logger.info(
@@ -275,6 +423,36 @@ class MemoryOrchestrator:
                 logger.warning("Hindsight init failed (non-fatal): %s", exc)
                 self._hindsight_client = None
         # End Hindsight initialization
+
+        if self.mem0_enabled:
+            try:
+                graphiti_group = str(
+                    (self.config.get("graphiti", {}) or {}).get("group_id", "")
+                ).strip()
+                if not self._mem0_user_id:
+                    self._mem0_user_id = (
+                        str(self._hindsight_bank_id or "").strip()
+                        or graphiti_group
+                        or "default"
+                    )
+                client = _Mem0HTTPClient(
+                    api_url=self._mem0_api_url,
+                    api_key=self._mem0_api_key,
+                    timeout_s=self._mem0_timeout_s,
+                )
+                ok, detail = client.ping()
+                if ok:
+                    self._mem0_client = client
+                    logger.info(
+                        "Mem0 client initialized (api_url=%s, user_id=%s)",
+                        self._mem0_api_url,
+                        self._mem0_user_id,
+                    )
+                else:
+                    logger.warning("Mem0 init failed (unreachable): %s", detail)
+            except Exception as exc:
+                logger.warning("Mem0 init failed (non-fatal): %s", exc)
+                self._mem0_client = None
 
     def prefetch(self, query: str, context: Optional[Dict[str, Any]] = None) -> str:
         if not query or not query.strip():
@@ -330,6 +508,16 @@ class MemoryOrchestrator:
             except Exception as exc:
                 logger.warning("Hindsight prefetch failed (non-fatal): %s", exc)
         # End Hindsight prefetch
+
+        if self.mem0_enabled and self._mem0_client and self._should_recall_mem0(query):
+            try:
+                mem0_items = self._mem0_query(query)
+                if mem0_items:
+                    sections.append(
+                        "# Mem0 Recall\n" + "\n".join(f"- {item}" for item in mem0_items)
+                    )
+            except Exception as exc:
+                logger.warning("Mem0 prefetch failed (non-fatal): %s", exc)
 
         if self._reflector_worker and session_id:
             try:
@@ -391,7 +579,12 @@ class MemoryOrchestrator:
         # Hindsight retain
         if self.hindsight_enabled and self._hindsight_client:
             try:
-                transcript = f"User: {user_message}\nAssistant: {assistant_message}"
+                safe_user = self._clip_hindsight_content(str(user_message or ""), self._hindsight_live_max_chars)
+                safe_assistant = self._clip_hindsight_content(
+                    str(assistant_message or ""),
+                    self._hindsight_live_max_chars,
+                )
+                transcript = f"User: {safe_user}\nAssistant: {safe_assistant}"
                 safe_metadata = self._normalize_hindsight_metadata(metadata or {})
                 if not self._should_retain_live_turn():
                     return sync_stats
@@ -407,6 +600,35 @@ class MemoryOrchestrator:
             except Exception as exc:
                 logger.warning("Hindsight retain failed (non-fatal): %s", exc)
         # End Hindsight retain
+
+        if self.mem0_enabled and self._mem0_client:
+            try:
+                safe_user = self._clip_mem0_content(str(user_message or ""))
+                safe_assistant = self._clip_mem0_content(str(assistant_message or ""))
+                if safe_user or safe_assistant:
+                    transcript = f"User: {safe_user}\nAssistant: {safe_assistant}".strip()
+                    nsfw_tag, nsfw_reason = self._classify_nsfw(transcript) if self.nsfw_save else (0, "")
+                    mem0_metadata: Dict[str, Any] = {
+                        "session_id": session_id or "unknown",
+                        "source": "local_memory_sync_turn",
+                    }
+                    if nsfw_tag:
+                        mem0_metadata["nsfw_tag"] = "1"
+                        mem0_metadata["nsfw_reason"] = nsfw_reason or "keyword"
+                    source_key = self._build_mem0_source_key(
+                        session_id=session_id,
+                        transcript=transcript,
+                    )
+                    if self._mem0_retain_async:
+                        threading.Thread(
+                            target=self._mem0_retain_once,
+                            args=(safe_user, safe_assistant, mem0_metadata, source_key),
+                            daemon=True,
+                        ).start()
+                    else:
+                        self._mem0_retain_once(safe_user, safe_assistant, mem0_metadata, source_key)
+            except Exception as exc:
+                logger.warning("Mem0 retain failed (non-fatal): %s", exc)
 
         return sync_stats
 
@@ -433,6 +655,10 @@ class MemoryOrchestrator:
             "WHERE id > ?",
         ]
         params: List[Any] = [start_id]
+        if self._ingest_allowed_roles:
+            role_placeholders = ",".join("?" for _ in self._ingest_allowed_roles)
+            sql.append(f"AND lower(role) IN ({role_placeholders})")
+            params.extend(sorted(self._ingest_allowed_roles))
         if session_id:
             sql.append("AND session_id = ?")
             params.append(session_id)
@@ -444,13 +670,14 @@ class MemoryOrchestrator:
         with self._connect_index() as conn:
             raw_rows = conn.execute("\n".join(sql), tuple(params)).fetchall()
 
-        episodes = self._build_backfill_episodes(raw_rows)
+        episodes = self._build_backfill_episodes(raw_rows, max_chars=self._hindsight_backfill_max_chars)
         scanned_rows = len(raw_rows)
         scanned_episodes = len(episodes)
         retained = 0
         duplicates = 0
         failed = 0
         last_ok_turn_id = start_id
+        failure_seen = False
         last_seen_turn_id = start_id
         errors: List[str] = []
 
@@ -468,16 +695,20 @@ class MemoryOrchestrator:
                 status = self._hindsight_retain_once(transcript, metadata, source_key)
                 if status.get("retained"):
                     retained += 1
-                    last_ok_turn_id = end_turn_id
+                    if not failure_seen:
+                        last_ok_turn_id = end_turn_id
                 elif status.get("duplicate"):
                     duplicates += 1
-                    last_ok_turn_id = end_turn_id
+                    if not failure_seen:
+                        last_ok_turn_id = end_turn_id
                 else:
                     failed += 1
+                    failure_seen = True
             except Exception as exc:
                 failed += 1
+                failure_seen = True
                 if len(errors) < 10:
-                    errors.append(f"{source_key}: {exc}")
+                    errors.append(f"{source_key}: {exc.__class__.__name__}: {exc}")
 
         if not dry_run and scanned_rows > 0:
             self._set_hindsight_backfill_checkpoint(last_ok_turn_id)
@@ -491,6 +722,112 @@ class MemoryOrchestrator:
             "last_checkpoint_turn_id": last_ok_turn_id if not dry_run else self._get_hindsight_backfill_checkpoint(),
             "scanned_rows": scanned_rows,
             "scanned_episodes": scanned_episodes,
+            "retained": retained,
+            "duplicates": duplicates,
+            "failed": failed,
+            "errors": errors,
+        }
+
+    def mem0_backfill(
+        self,
+        *,
+        max_items: int = 500,
+        from_turn_id: Optional[int] = None,
+        session_id: str = "",
+        include_nsfw: bool = True,
+        dry_run: bool = False,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        if not self.mem0_enabled or not self._mem0_client:
+            return {"success": False, "error": "mem0 is disabled or unavailable"}
+
+        max_items = max(1, min(int(max_items), 5000))
+        checkpoint = 0 if force else self._get_mem0_backfill_checkpoint()
+        start_id = int(from_turn_id) if from_turn_id is not None else checkpoint
+
+        sql = [
+            "SELECT id, session_id, role, content, created_at, nsfw_tag",
+            "FROM memory_turns",
+            "WHERE id > ?",
+        ]
+        params: List[Any] = [start_id]
+        if self._ingest_allowed_roles:
+            role_placeholders = ",".join("?" for _ in self._ingest_allowed_roles)
+            sql.append(f"AND lower(role) IN ({role_placeholders})")
+            params.extend(sorted(self._ingest_allowed_roles))
+        if session_id:
+            sql.append("AND session_id = ?")
+            params.append(session_id)
+        if not include_nsfw:
+            sql.append("AND nsfw_tag = 0")
+        sql.append("ORDER BY id ASC LIMIT ?")
+        params.append(max_items)
+
+        with self._connect_index() as conn:
+            raw_rows = conn.execute("\n".join(sql), tuple(params)).fetchall()
+
+        items = self._build_mem0_backfill_items(raw_rows, max_chars=self._mem0_live_max_chars)
+        scanned_rows = len(raw_rows)
+        scanned_items = len(items)
+        retained = 0
+        duplicates = 0
+        failed = 0
+        last_ok_turn_id = start_id
+        failure_seen = False
+        last_seen_turn_id = start_id
+        errors: List[str] = []
+
+        for item in items:
+            source_key = str(item["source_key"])
+            safe_user = str(item.get("safe_user", ""))
+            safe_assistant = str(item.get("safe_assistant", ""))
+            metadata = dict(item.get("metadata", {}))
+            end_turn_id = int(item.get("end_turn_id", start_id))
+            last_seen_turn_id = max(last_seen_turn_id, end_turn_id)
+
+            if dry_run:
+                retained += 1
+                last_ok_turn_id = end_turn_id
+                continue
+
+            try:
+                status = self._mem0_retain_once(
+                    safe_user=safe_user,
+                    safe_assistant=safe_assistant,
+                    metadata=metadata,
+                    source_key=source_key,
+                )
+                if status.get("retained"):
+                    retained += 1
+                    if not failure_seen:
+                        last_ok_turn_id = end_turn_id
+                elif status.get("duplicate"):
+                    duplicates += 1
+                    if not failure_seen:
+                        last_ok_turn_id = end_turn_id
+                else:
+                    failed += 1
+                    failure_seen = True
+            except Exception as exc:
+                failed += 1
+                failure_seen = True
+                if len(errors) < 10:
+                    errors.append(f"{source_key}: {exc.__class__.__name__}: {exc}")
+
+        if not dry_run and scanned_rows > 0:
+            self._set_mem0_backfill_checkpoint(last_ok_turn_id)
+
+        return {
+            "success": True,
+            "dry_run": dry_run,
+            "user_id": self._mem0_user_id or "default",
+            "start_turn_id": start_id,
+            "last_seen_turn_id": last_seen_turn_id,
+            "last_checkpoint_turn_id": (
+                last_ok_turn_id if not dry_run else self._get_mem0_backfill_checkpoint()
+            ),
+            "scanned_rows": scanned_rows,
+            "scanned_items": scanned_items,
             "retained": retained,
             "duplicates": duplicates,
             "failed": failed,
@@ -808,23 +1145,36 @@ class MemoryOrchestrator:
         # Keep existing memory intact, but backfill configurable NSFW tags on legacy rows.
         if not self.nsfw_save:
             return
-        for kw in self._nsfw_keywords:
-            conn.execute(
-                """
-                UPDATE memory_turns
-                SET nsfw_tag = 1, nsfw_reason = COALESCE(NULLIF(nsfw_reason, ''), ?)
-                WHERE nsfw_tag = 0
-                  AND instr(lower(content), lower(?)) > 0
-                """,
-                (f"keyword:{kw}", kw),
-            )
+        rows = conn.execute(
+            """
+            SELECT id, content
+            FROM memory_turns
+            WHERE nsfw_tag = 0
+            """
+        ).fetchall()
+        for row in rows:
+            row_id = int(row[0])
+            tag, reason = self._classify_nsfw(row[1] or "")
+            if tag:
+                conn.execute(
+                    """
+                    UPDATE memory_turns
+                    SET nsfw_tag = 1, nsfw_reason = COALESCE(NULLIF(nsfw_reason, ''), ?)
+                    WHERE id = ?
+                    """,
+                    (reason, row_id),
+                )
 
     def _classify_nsfw(self, content: Any) -> tuple[int, str]:
-        text = str(content or "").lower()
+        text = str(content or "")
         if not text.strip():
             return 0, ""
-        for kw in self._nsfw_keywords:
-            if kw in text:
+        lowered = text.lower()
+        for kw, pattern in self._nsfw_keyword_rules:
+            if pattern is None:
+                if kw in lowered:
+                    return 1, f"keyword:{kw}"
+            elif pattern.search(lowered):
                 return 1, f"keyword:{kw}"
         return 0, ""
 
@@ -848,6 +1198,12 @@ class MemoryOrchestrator:
             return True
         q = str(query or "").lower()
         return any(tok in q for tok in self._ondemand_keywords)
+
+    def _should_recall_mem0(self, query: str) -> bool:
+        if not self._mem0_require_explicit_query:
+            return True
+        q = str(query or "").lower()
+        return any(tok in q for tok in self._mem0_query_keywords)
 
     def _should_ingest_row(self, row: Dict[str, Any]) -> bool:
         role = str(row.get("role", "")).strip().lower()
@@ -949,6 +1305,114 @@ class MemoryOrchestrator:
             out.append(kw)
         return out
 
+    @staticmethod
+    def _compile_nsfw_keyword_rules(keywords: List[str]) -> List[tuple[str, Optional[re.Pattern[str]]]]:
+        rules: List[tuple[str, Optional[re.Pattern[str]]]] = []
+        for kw in keywords:
+            token = str(kw or "").strip().lower()
+            if not token:
+                continue
+            if re.fullmatch(r"[a-z0-9+._-]+", token):
+                pat = re.compile(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", re.IGNORECASE)
+                rules.append((token, pat))
+            else:
+                rules.append((token, None))
+        return rules
+
+    def _mem0_query(self, query: str) -> List[str]:
+        if not self._mem0_client:
+            return []
+        response = self._mem0_client.search(
+            query=str(query or ""),
+            user_id=self._mem0_user_id or "default",
+            top_k=self._mem0_recall_max_results,
+        )
+        rows = response.get("results", [])
+        if not isinstance(rows, list):
+            return []
+        out: List[str] = []
+        for row in rows[: self._mem0_recall_max_results]:
+            text = ""
+            if isinstance(row, dict):
+                text = str(row.get("memory") or row.get("text") or "").strip()
+            else:
+                text = str(row).strip()
+            if not text:
+                continue
+            if len(text) > 260:
+                text = text[:260] + "..."
+            out.append(text)
+        return out
+
+    def _mem0_retain_once(
+        self,
+        safe_user: str,
+        safe_assistant: str,
+        metadata: Dict[str, Any],
+        source_key: str,
+    ) -> Dict[str, Any]:
+        if not self._mem0_client:
+            return {"retained": False, "duplicate": False}
+        payload_preview = f"{safe_user}\n{safe_assistant}".strip()
+        retain_hash = self._build_mem0_retain_hash(payload_preview, source_key)
+
+        with self._connect_index() as conn:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO mem0_retain_log
+                (retain_hash, user_id, source_key, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    retain_hash,
+                    self._mem0_user_id or "default",
+                    source_key,
+                    self._now_iso(),
+                ),
+            )
+            conn.commit()
+            if not cur.rowcount:
+                return {"retained": False, "duplicate": True}
+
+        messages: List[Dict[str, str]] = []
+        if safe_user:
+            messages.append({"role": "user", "content": safe_user})
+        if safe_assistant:
+            messages.append({"role": "assistant", "content": safe_assistant})
+        if not messages:
+            return {"retained": False, "duplicate": False}
+
+        try:
+            self._mem0_client.add_memory(
+                messages=messages,
+                user_id=self._mem0_user_id or "default",
+                metadata=metadata,
+            )
+        except Exception:
+            with self._connect_index() as conn:
+                conn.execute("DELETE FROM mem0_retain_log WHERE retain_hash = ?", (retain_hash,))
+                conn.commit()
+            raise
+        return {"retained": True, "duplicate": False}
+
+    @staticmethod
+    def _build_mem0_retain_hash(payload: str, source_key: str) -> str:
+        raw = f"{source_key}|{payload}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _build_mem0_source_key(self, *, session_id: str, transcript: str) -> str:
+        sid = str(session_id or "").strip()
+        digest = hashlib.sha256(f"{sid}|{transcript}".encode("utf-8")).hexdigest()[:20]
+        return f"mem0:{sid}:{digest}"
+
+    def _clip_mem0_content(self, content: str) -> str:
+        text = str(content or "").strip()
+        if not text:
+            return ""
+        if len(text) <= self._mem0_live_max_chars:
+            return text
+        return text[: self._mem0_live_max_chars] + "\n...[truncated by local_memory for mem0 retain]"
+
     def _ensure_hindsight_bank(self) -> None:
         if not self._hindsight_client:
             return
@@ -962,6 +1426,47 @@ class MemoryOrchestrator:
             msg = str(exc).lower()
             if "already" in msg or "exists" in msg or "409" in msg or "conflict" in msg:
                 return
+            raise
+
+    def _ensure_hindsight_client_thread_compat(self) -> None:
+        """Rebuild modern hindsight client when crossing thread boundaries.
+
+        hindsight-client's modern implementation keeps an aiohttp session that is
+        bound to the event loop/thread that first created it. Reusing that same
+        client from another thread can fail with:
+        "Timeout context manager should be used inside a task".
+        """
+        if not self._hindsight_client:
+            return
+        if self._hindsight_client_flavor != "modern":
+            return
+
+        current_tid = threading.get_ident()
+        if self._hindsight_client_thread_id == current_tid:
+            return
+
+        try:
+            from hindsight_client import Hindsight  # type: ignore
+        except Exception as exc:
+            logger.warning("Hindsight thread-compat import failed: %s", exc)
+            return
+
+        try:
+            old_client = self._hindsight_client
+            kwargs: Dict[str, Any] = {"base_url": self._hindsight_api_url, "timeout": self._hindsight_timeout}
+            if self._hindsight_api_key:
+                kwargs["api_key"] = self._hindsight_api_key
+            self._hindsight_client = Hindsight(**kwargs)
+            self._hindsight_client_thread_id = current_tid
+            # Best-effort close to avoid leaked sessions; ignore loop affinity failures.
+            try:
+                close_fn = getattr(old_client, "close", None)
+                if callable(close_fn):
+                    close_fn()
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.warning("Hindsight thread-compat rebuild failed: %s", exc)
             raise
 
     def _should_retain_live_turn(self) -> bool:
@@ -1029,7 +1534,45 @@ class MemoryOrchestrator:
             )
             conn.commit()
 
-    def _build_backfill_episodes(self, raw_rows: List[Any]) -> List[Dict[str, Any]]:
+    def _get_mem0_backfill_checkpoint(self) -> int:
+        with self._connect_index() as conn:
+            row = conn.execute(
+                """
+                SELECT last_backfill_turn_id
+                FROM mem0_state
+                WHERE user_id = ?
+                """,
+                (self._mem0_user_id or "default",),
+            ).fetchone()
+        if not row or row[0] is None:
+            return 0
+        return max(0, int(row[0]))
+
+    def _set_mem0_backfill_checkpoint(self, turn_id: int) -> None:
+        turn_id = max(0, int(turn_id))
+        with self._connect_index() as conn:
+            conn.execute(
+                """
+                INSERT INTO mem0_state (user_id, last_backfill_turn_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    last_backfill_turn_id = CASE
+                        WHEN excluded.last_backfill_turn_id > mem0_state.last_backfill_turn_id
+                        THEN excluded.last_backfill_turn_id
+                        ELSE mem0_state.last_backfill_turn_id
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (self._mem0_user_id or "default", turn_id, self._now_iso()),
+            )
+            conn.commit()
+
+    def _build_backfill_episodes(
+        self,
+        raw_rows: List[Any],
+        *,
+        max_chars: int,
+    ) -> List[Dict[str, Any]]:
         episodes: List[Dict[str, Any]] = []
         i = 0
         while i < len(raw_rows):
@@ -1037,7 +1580,7 @@ class MemoryOrchestrator:
             row_id = int(row[0])
             sid = str(row[1] or "")
             role = str(row[2] or "").strip().lower()
-            content = str(row[3] or "").strip()
+            content = self._clip_hindsight_content(str(row[3] or ""), max_chars)
             created_at = str(row[4] or "")
             if not content:
                 i += 1
@@ -1051,7 +1594,7 @@ class MemoryOrchestrator:
             ):
                 next_row = raw_rows[i + 1]
                 aid = int(next_row[0])
-                assistant_content = str(next_row[3] or "").strip()
+                assistant_content = self._clip_hindsight_content(str(next_row[3] or ""), max_chars)
                 transcript = f"User: {content}\nAssistant: {assistant_content}"
                 episodes.append(
                     {
@@ -1091,9 +1634,87 @@ class MemoryOrchestrator:
             i += 1
         return episodes
 
+    def _build_mem0_backfill_items(
+        self,
+        raw_rows: List[Any],
+        *,
+        max_chars: int,
+    ) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        i = 0
+        while i < len(raw_rows):
+            row = raw_rows[i]
+            row_id = int(row[0])
+            sid = str(row[1] or "")
+            role = str(row[2] or "").strip().lower()
+            content = self._clip_mem0_content(str(row[3] or "")[:max_chars])
+            created_at = str(row[4] or "")
+            if not content:
+                i += 1
+                continue
+
+            if (
+                role == "user"
+                and i + 1 < len(raw_rows)
+                and str(raw_rows[i + 1][2] or "").strip().lower() == "assistant"
+                and str(raw_rows[i + 1][1] or "") == sid
+            ):
+                next_row = raw_rows[i + 1]
+                aid = int(next_row[0])
+                assistant_content = self._clip_mem0_content(str(next_row[3] or "")[:max_chars])
+                meta: Dict[str, Any] = {
+                    "session_id": sid,
+                    "source": "local_memory_mem0_backfill",
+                    "source_turn_ids": f"{row_id},{aid}",
+                    "created_at": created_at,
+                }
+                pair_text = f"User: {content}\nAssistant: {assistant_content}"
+                pair_nsfw_tag, pair_nsfw_reason = self._classify_nsfw(pair_text)
+                if pair_nsfw_tag:
+                    meta["nsfw_tag"] = "1"
+                    meta["nsfw_reason"] = pair_nsfw_reason
+                items.append(
+                    {
+                        "source_key": f"mem0_backfill:pair:{row_id}:{aid}",
+                        "safe_user": content,
+                        "safe_assistant": assistant_content,
+                        "metadata": meta,
+                        "end_turn_id": aid,
+                    }
+                )
+                i += 2
+                continue
+
+            safe_user = content if role != "assistant" else ""
+            safe_assistant = content if role == "assistant" else ""
+            meta = {
+                "session_id": sid,
+                "source": "local_memory_mem0_backfill",
+                "source_turn_ids": str(row_id),
+                "created_at": created_at,
+                "source_role": role or "unknown",
+            }
+            single_nsfw_tag, single_nsfw_reason = self._classify_nsfw(content)
+            if single_nsfw_tag:
+                meta["nsfw_tag"] = "1"
+                meta["nsfw_reason"] = single_nsfw_reason
+            items.append(
+                {
+                    "source_key": f"mem0_backfill:turn:{row_id}",
+                    "safe_user": safe_user,
+                    "safe_assistant": safe_assistant,
+                    "metadata": meta,
+                    "end_turn_id": row_id,
+                }
+            )
+            i += 1
+
+        return items
+
     def _hindsight_query(self, query: str) -> str:
         if not self._hindsight_client:
             return ""
+        self._ensure_hindsight_client_thread_compat()
 
         max_tokens = max(64, self._hindsight_recall_max_results * 50)
         if self._hindsight_recall_method == "reflect":
@@ -1178,9 +1799,20 @@ class MemoryOrchestrator:
         payload = f"{self._hindsight_bank_id}|{source_key}|{transcript}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _clip_hindsight_content(content: str, max_chars: int) -> str:
+        text = str(content or "").strip()
+        if not text:
+            return ""
+        if len(text) <= max_chars:
+            return text
+        head = text[:max_chars]
+        return head + "\n...[truncated by local_memory for hindsight retain]"
+
     def _hindsight_retain(self, transcript: str, metadata: Dict[str, str]) -> None:
         if not self._hindsight_client:
             return
+        self._ensure_hindsight_client_thread_compat()
         kwargs = {
             "content": transcript,
             "context": "conversation between Hermes Agent and the User",
@@ -1190,7 +1822,11 @@ class MemoryOrchestrator:
             kwargs["bank_id"] = self._hindsight_bank_id
             self._hindsight_client.retain(**kwargs)
             return
-        self._hindsight_client.retain(bank_id=self._hindsight_bank_id, **kwargs)
+        self._hindsight_client.retain_batch(
+            bank_id=self._hindsight_bank_id,
+            items=[kwargs],
+            retain_async=self._hindsight_retain_server_async,
+        )
 
     @staticmethod
     def _normalize_hindsight_metadata(metadata: Dict[str, Any]) -> Dict[str, str]:
